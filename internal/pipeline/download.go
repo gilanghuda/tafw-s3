@@ -71,10 +71,22 @@ func (d *downloader) runOnce(ctx context.Context, opts Options) error {
 			continue
 		}
 
-		parts := d.collectParts(g)
-		if len(parts) == 0 {
-			// Hanya ada success=false (atau tidak ada part sukses): lewati tanpa file.
-			d.log.Warn("tidak ada part success=true, dilewati", "folder", g.folder)
+		successParts := d.collectParts(g, d.cfg.Watcher.SuccessFolder)
+		failedParts := d.collectParts(g, d.cfg.Watcher.FailedFolder)
+
+		// Tentukan tujuan: utamakan success=true; bila tidak ada part sukses,
+		// pakai success=false -> ERROR.
+		var parts []string
+		var destDir string
+		switch {
+		case len(successParts) > 0:
+			parts = successParts
+			destDir = d.cfg.Folders.Outcoming
+		case len(failedParts) > 0:
+			parts = failedParts
+			destDir = d.cfg.Folders.Error
+		default:
+			d.log.Warn("tidak ada part success=true/false, dilewati", "folder", g.folder)
 			if !opts.DryRun {
 				if err := d.store.MarkProcessed(g.folder, state.ProcessedRecord{Parts: 0}); err != nil {
 					d.log.Warn("gagal mencatat state", "folder", g.folder, "err", err)
@@ -86,26 +98,26 @@ func (d *downloader) runOnce(ctx context.Context, opts Options) error {
 		outName := g.folder + d.cfg.Watcher.OutputSuffix
 		if opts.DryRun {
 			d.log.Info("dry-run: akan gabung output",
-				"folder", g.folder, "parts", len(parts), "out", outName)
+				"folder", g.folder, "parts", len(parts), "dest", destDir, "out", outName)
 			processed++
 			continue
 		}
 
-		rows, err := d.concatAndWrite(ctx, g, parts, outName)
+		rows, err := d.concatAndWrite(ctx, parts, destDir, outName)
 		if err != nil {
 			d.log.Error("gagal menggabungkan output", "folder", g.folder, "err", err)
 			_ = d.writeError(g.folder, err)
 			continue
 		}
 
-		if d.cfg.Watcher.VerifyCounts {
+		if destDir == d.cfg.Folders.Outcoming && d.cfg.Watcher.VerifyCounts {
 			want, ok, verr := d.expectedSuccess(ctx, g)
 			if verr != nil {
 				d.log.Warn("verifikasi jumlah baris dilewati", "folder", g.folder, "err", verr)
 			} else if ok && want != rows {
 				err := fmt.Errorf("jumlah baris %d != total_success %d", rows, want)
 				d.log.Error("verifikasi gagal", "folder", g.folder, "err", err)
-				_ = os.Remove(filepath.Join(d.cfg.Folders.Outcoming, outName))
+				_ = os.Remove(filepath.Join(destDir, outName))
 				_ = d.writeError(g.folder, err)
 				continue
 			}
@@ -119,7 +131,7 @@ func (d *downloader) runOnce(ctx context.Context, opts Options) error {
 			d.log.Warn("gagal mencatat state", "folder", g.folder, "err", err)
 		}
 		d.log.Info("output digabung",
-			"folder", g.folder, "parts", len(parts), "rows", rows, "out", outName)
+			"folder", g.folder, "parts", len(parts), "rows", rows, "dest", destDir, "out", outName)
 		processed++
 	}
 
@@ -226,15 +238,16 @@ func folderSignature(objs []s3client.ObjectInfo) string {
 	return fmt.Sprintf("%d:%d:%d", len(objs), total, maxMod)
 }
 
-// collectParts mengumpulkan dan mengurutkan key part di success=true.
-func (d *downloader) collectParts(g outputGroup) []string {
-	prefix := d.cfg.S3.OutputPrefix + g.folder + "/" + d.cfg.Watcher.OutputDirName + "/" + d.cfg.Watcher.SuccessFolder + "/"
+// collectParts mengumpulkan dan mengurutkan key part di subfolder (success=true
+// atau success=false) di bawah output/<sub>/.
+func (d *downloader) collectParts(g outputGroup, sub string) []string {
+	prefix := d.cfg.S3.OutputPrefix + g.folder + "/" + d.cfg.Watcher.OutputDirName + "/" + sub + "/"
 	var parts []string
 	for _, o := range g.objects {
 		if strings.HasPrefix(o.Key, prefix) {
 			base := o.Key[len(prefix):]
 			if base == "" || strings.Contains(base, "/") {
-				continue // hanya file langsung di dalam folder success
+				continue // hanya file langsung di dalam folder
 			}
 			if !strings.HasPrefix(base, "part-") {
 				continue
@@ -246,11 +259,11 @@ func (d *downloader) collectParts(g outputGroup) []string {
 	return parts
 }
 
-// concatAndWrite mengunduh semua part, membuang header part pertama, menulis
-// hasil gabungan secara atomic ke OUTCOMING/<outName>. Mengembalikan jumlah
-// baris data yang ditulis.
-func (d *downloader) concatAndWrite(ctx context.Context, g outputGroup, parts []string, outName string) (int64, error) {
-	finalPath := filepath.Join(d.cfg.Folders.Outcoming, outName)
+// concatAndWrite mengunduh semua part, mempertahankan header part pertama dan
+// membuang header part berikutnya (opsi A), lalu menulis hasil gabungan secara
+// atomic ke destDir/<outName>. Mengembalikan jumlah baris data yang ditulis.
+func (d *downloader) concatAndWrite(ctx context.Context, parts []string, destDir, outName string) (int64, error) {
+	finalPath := filepath.Join(destDir, outName)
 	tmpPath := finalPath + ".tmp"
 
 	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
@@ -265,7 +278,7 @@ func (d *downloader) concatAndWrite(ctx context.Context, g outputGroup, parts []
 	}
 
 	for i, key := range parts {
-		if err := d.copyPart(ctx, key, i == 0, counter); err != nil {
+		if err := d.copyPart(ctx, key, i != 0, counter); err != nil {
 			cleanup()
 			return 0, err
 		}
@@ -284,7 +297,8 @@ func (d *downloader) concatAndWrite(ctx context.Context, g outputGroup, parts []
 }
 
 // copyPart menyalin satu part ke writer. Bila dropHeader true, baris pertama
-// (header) dibuang.
+// (header) dibuang. Untuk part pertama dropHeader=false sehingga header
+// dipertahankan (opsi A).
 func (d *downloader) copyPart(ctx context.Context, key string, dropHeader bool, w io.Writer) error {
 	rc, err := d.client.GetStream(ctx, key)
 	if err != nil {

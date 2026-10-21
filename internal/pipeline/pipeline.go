@@ -29,12 +29,13 @@ type Options struct {
 }
 
 // EnsureFolders membuat folder kerja yang wajib ada (INCOMING, OUTCOMING,
-// ERROR, state, logs). Folder ini WAJIB ada sebelum UAT/Deploy.
+// ERROR, INCOMING_SENT, state, logs). Folder ini WAJIB ada sebelum UAT/Deploy.
 func EnsureFolders(cfg *config.Config) error {
 	dirs := []string{
 		cfg.Folders.Incoming,
 		cfg.Folders.Outcoming,
 		cfg.Folders.Error,
+		cfg.Folders.IncomingSent,
 		cfg.Folders.State,
 		cfg.Folders.Logs,
 	}
@@ -120,7 +121,7 @@ func uploadOnce(ctx context.Context, cfg *config.Config, log *slog.Logger, store
 			stamp = s
 		}
 
-		key := cfg.S3.InputPrefix + name
+		key := cfg.S3.InputPrefix + watch.ObjectName(name, cfg.Watcher.RenameInputLower)
 
 		if opts.DryRun {
 			log.Info("dry-run: akan upload", "file", name, "key", key, "size", stamp.Size)
@@ -146,9 +147,9 @@ func uploadOnce(ctx context.Context, cfg *config.Config, log *slog.Logger, store
 			log.Warn("gagal mencatat state upload", "file", name, "err", err)
 		}
 
-		// Hapus dari INCOMING sesuai perilaku dokumen (file input hilang).
-		if err := os.Remove(path); err != nil {
-			log.Warn("gagal menghapus file dari INCOMING", "file", name, "err", err)
+		// Pindahkan file input yang sudah terkirim ke INCOMING_SENT.
+		if err := moveToDir(cfg.Folders.IncomingSent, path); err != nil {
+			log.Warn("gagal memindahkan file ke INCOMING_SENT", "file", name, "err", err)
 		}
 		log.Info("upload sukses", "file", name, "key", key, "size", stamp.Size)
 		processed++
@@ -158,6 +159,26 @@ func uploadOnce(ctx context.Context, cfg *config.Config, log *slog.Logger, store
 		log.Debug("siklus upload selesai: tidak ada file baru")
 	} else {
 		log.Info("siklus upload selesai", "jumlah", processed)
+	}
+	return nil
+}
+
+// moveToDir memindahkan file src ke folder dst (membuat dst bila perlu).
+// Bila nama tujuan sudah ada, ditambahkan suffix waktu. Fallback copy+remove
+// dipakai bila rename lintas device gagal.
+func moveToDir(dir, src string) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	base := filepath.Base(src)
+	dst := filepath.Join(dir, base)
+	if _, err := os.Stat(dst); err == nil {
+		dst = filepath.Join(dir, fmt.Sprintf("%s.%d", base, time.Now().Unix()))
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if err2 := copyThenRemove(src, dst); err2 != nil {
+			return fmt.Errorf("rename gagal (%v) dan copy gagal: %w", err, err2)
+		}
 	}
 	return nil
 }

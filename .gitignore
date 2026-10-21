@@ -1,0 +1,31 @@
+# Binaries
+/tafw
+/tafw.exe
+/tafw-linux-amd64
+/tafw-linux-arm64
+*.exe
+/dist/
+/build/
+
+# Local config (may contain environment-specific paths), keep the example
+/config.yaml
+/local.yaml
+
+# CREDENTIALS - never commit (kecuali template contoh)
+credentials
+credentials.*
+*.pem
+*.key
+!credentials.example
+!deploy/credentials.example
+
+# Runtime state / logs
+/state/
+/logs/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

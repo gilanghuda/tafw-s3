@@ -2,11 +2,13 @@
 //
 // Dua mode utama:
 //
-//	tafw upload    watch folder INCOMING, upload file *.TAFCM ke S3 (sandbox/)
-//	tafw download  poll S3, gabung output success=true ke OUTCOMING
+//	tafw upload    watch folder INCOMING, upload file *.txt/*.TAFCM ke S3
+//	               (SANDBOX/, nama di-rename jadi .tafcm huruf kecil)
+//	tafw download  poll S3 (SANDBOX/): success=true -> OUTCOMING,
+//	               success=false -> ERROR (hasil gabungan <folder>.tafcm)
 //
-// Lihat README.md untuk kebutuhan folder INCOMING/OUTCOMING/ERROR dan langkah
-// UAT/Deploy.
+// Lihat README.md untuk kebutuhan folder INCOMING/OUTCOMING/ERROR/INCOMING_SENT
+// dan langkah UAT/Deploy.
 package main
 
 import (
@@ -71,7 +73,7 @@ func runMode(args []string, mode string) error {
 		return err
 	}
 
-	log, closer, err := logging.New(cfg.Logging.Level, cfg.Logging.File)
+	log, closer, err := logging.NewWithRoll(cfg.Logging.Level, cfg.Logging.File, cfg.Logging.DailyRoll)
 	if err != nil {
 		return err
 	}
@@ -115,7 +117,7 @@ Penggunaan:
   tafw download  [--config PATH] [--dry-run] [--once]
   tafw version
 
-Folder INCOMING, OUTCOMING, dan ERROR wajib dibuat lebih dulu.
+Folder INCOMING, OUTCOMING, ERROR, dan INCOMING_SENT wajib dibuat lebih dulu.
 Lihat README.md bagian "Setup Folder (WAJIB untuk UAT & Deploy)".
 `)
 }

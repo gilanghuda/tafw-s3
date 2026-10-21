@@ -16,20 +16,24 @@ Untuk build binary, lihat **`BUILD.md`**.
 ## Ringkasan alur
 
 ```
-INCOMING/<file>.TAFCM
-   │  (tafw upload)
+INCOMING/<file>.txt|.TAFCM
+   │  (tafw upload: rename ke .tafcm huruf kecil)
    ▼
-s3://taf-batch/SANDBOX/<file>.TAFCM       <-- PREFIX HURUF BESAR
+s3://taf-batch/SANDBOX/<file>.tafcm       <-- PREFIX HURUF BESAR
    │  (Provenir proses)
    ▼
 s3://taf-batch/SANDBOX/TAFCM_<datetime>/output/success=true/part-*.txt
-   │  (tafw download: gabung, buang header part-00000)
+   │  (tafw download: gabung; header part pertama DIPERTAHANKAN)
    ▼
-/home/svr-adins/OUTCOMING/TAFCM_<datetime>.txt
+/home/svr-adins/OUTCOMING/TAFCM_<datetime>.tafcm
+
+   (bila Provenir hanya menghasilkan output/success=false/part-*)
+   ▼
+/home/svr-adins/ERROR/TAFCM_<datetime>.tafcm
 ```
 
-> ⚠️ **Prefix wajib `SANDBOX/` (huruf besar).** Salah case (`sandbox/`) membuat
-> file masuk ke folder yang tidak dipantau Provenir.
+> ⚠️ **Prefix wajib `SANDBOX/` (huruf besar).**
+> Salah case (`sandbox/`) membuat file masuk ke folder yang tidak dipantau Provenir.
 
 ---
 
@@ -37,12 +41,13 @@ s3://taf-batch/SANDBOX/TAFCM_<datetime>/output/success=true/part-*.txt
 
 ```
 /home/svr-adins/
-├── INCOMING/      # taruh file *.TAFCM di sini
-├── OUTCOMING/     # hasil gabungan *.txt
-├── ERROR/         # file gagal + alasan (*.reason)
+├── INCOMING/      # taruh file *.txt / *.TAFCM di sini
+├── INCOMING_SENT/ # file input yang sudah sukses upload (DIPINDAH, bukan dihapus)
+├── OUTCOMING/     # hasil gabungan *.tafcm
+├── ERROR/         # file gagal + alasan (*.reason) dan hasil success=false *.tafcm
 ├── bin/tafw       # binary hasil build (BUILD.md)
 ├── state/         # state idempotency + state.json
-├── logs/          # upload.log, download.log (bila dipakai)
+├── logs/          # tafw-YYYYMMDD.log (rolling harian, bila dipakai)
 ├── config.yaml
 └── credentials    # chmod 600
 ```
@@ -51,7 +56,7 @@ Buat folder yang belum ada (semua argumen boleh mengandung `/` walau rbash):
 
 ```bash
 mkdir -p /home/svr-adins/bin /home/svr-adins/state /home/svr-adins/logs
-ls -ld /home/svr-adins/INCOMING /home/svr-adins/OUTCOMING /home/svr-adins/ERROR
+ls -ld /home/svr-adins/INCOMING /home/svr-adins/INCOMING_SENT /home/svr-adins/OUTCOMING /home/svr-adins/ERROR
 ```
 
 ---
@@ -99,6 +104,7 @@ credentials:
 
 folders:
   incoming: /home/svr-adins/INCOMING
+  incoming_sent: /home/svr-adins/INCOMING_SENT
   outcoming: /home/svr-adins/OUTCOMING
   error: /home/svr-adins/ERROR
   state: /home/svr-adins/state
@@ -109,18 +115,21 @@ watcher:
   poll_seconds: 30
   completion_method: status_json
   file_patterns:
+    - "*.txt"
     - "*.TAFCM"
   success_folder: "success=true"
   failed_folder: "success=false"
   output_dir_name: "output"
   output_folder_prefix: "TAFCM_"
   stability_windows: 2
-  output_suffix: ".txt"
+  output_suffix: ".tafcm"
+  rename_input_lower: true
   verify_counts: false
 
 logging:
   level: info
   file: ""
+  daily_roll: false
 ```
 
 ---
@@ -168,7 +177,8 @@ After=default.target
 Type=simple
 WorkingDirectory=/home/svr-adins
 ExecStart=/home/svr-adins/bin/tafw upload --config /home/svr-adins/config.yaml
-Environment=TAFW_LOG_FILE=/home/svr-adins/logs/upload.log
+Environment=TAFW_LOG_FILE=/home/svr-adins/logs
+Environment=TAFW_LOG_DAILY_ROLL=true
 Restart=always
 RestartSec=5
 
@@ -187,7 +197,8 @@ After=default.target
 Type=simple
 WorkingDirectory=/home/svr-adins
 ExecStart=/home/svr-adins/bin/tafw download --config /home/svr-adins/config.yaml
-Environment=TAFW_LOG_FILE=/home/svr-adins/logs/download.log
+Environment=TAFW_LOG_FILE=/home/svr-adins/logs
+Environment=TAFW_LOG_DAILY_ROLL=true
 Restart=always
 RestartSec=5
 
@@ -214,7 +225,7 @@ Lihat log:
 journalctl --user -u tafwatcher-upload -f
 journalctl --user -u tafwatcher-download -f
 # atau:
-tail -f /home/svr-adins/logs/upload.log
+tail -f /home/svr-adins/logs/tafw-$(date +%Y%m%d).log
 ```
 
 Bila muncul `Failed to connect to bus`, prefix env-nya:
@@ -231,26 +242,28 @@ Jangan logout sampai selesai.
 
 ```bash
 # 5a. Upload — taruh file TANPA spasi/tanda kurung
-cp /path/ke/input_file_test.TAFCM /home/svr-adins/INCOMING/input_file_test.TAFCM
+cp /path/ke/input_file_test.txt /home/svr-adins/INCOMING/input_file_test.txt
 journalctl --user -u tafwatcher-upload -f
 ```
 
 Ekspektasi:
-- log `"upload sukses"` dengan `"key":"SANDBOX/input_file_test.TAFCM"`;
-- file **hilang** dari `INCOMING`.
+- log `"upload sukses"` dengan `"key":"SANDBOX/input_file_test.tafcm"`;
+- file input **DIPINDAH** dari `INCOMING` ke `INCOMING_SENT` (rename ke `.tafcm`).
 
 ```bash
-ls -l /home/svr-adins/INCOMING/     # harus kosong
+ls -l /home/svr-adins/INCOMING/          # harus kosong
+ls -l /home/svr-adins/INCOMING_SENT/     # berisi input_file_test.tafcm
 ```
 
 ```bash
 # 5b. Download — tunggu Provenir menghasilkan folder TAFCM_<datetime>/
 journalctl --user -u tafwatcher-download -f
 ls -l /home/svr-adins/OUTCOMING/
-head -n 2 /home/svr-adins/OUTCOMING/*.txt
+head -n 2 /home/svr-adins/OUTCOMING/TAFCM_*.tafcm
 ```
 
-Ekspektasi: satu file `TAFCM_<datetime>.txt`, delimiter koma, tanpa baris header.
+Ekspektasi: satu file `TAFCM_<datetime>.tafcm`, delimiter koma, satu baris header
+di paling atas.
 
 ---
 
@@ -262,6 +275,9 @@ File yang gagal upload dipindah ke `ERROR/` + `<nama>.reason`:
 ls -l /home/svr-adins/ERROR/
 cat /home/svr-adins/ERROR/*.reason
 ```
+
+> `ERROR/` juga dapat berisi hasil gabungan `TAFCM_<datetime>.tafcm` bila Provenir
+> hanya menghasilkan `output/success=false/part-*`.
 
 Cek state idempotency:
 
@@ -321,7 +337,7 @@ crontab -l
 | `lookup ... on 127.0.0.53: i/o timeout` | binary di-build **tanpa cgo**; rebuild di Linux (`BUILD.md`) |
 | `dial tcp <ip>:443: i/o timeout` | IP S3 tertentu diblok firewall (intermiten); minta tim jaringan allowlist range S3 `ap-southeast-3`, sementara ulangi upload |
 | File input masuk `ERROR/` | buka file `*.reason` untuk alasan |
-| Output tak masuk `OUTCOMING` | pastikan `status.json` = `COMPLETED`; cek log downloader & `ERROR/` |
+| Output tak masuk `OUTCOMING` | pastikan `status.json` = `COMPLETED`; jika Provenir balas `success=false`, hasil gabungan masuk ke `ERROR/`; cek log downloader |
 | Service mati setelah logout | `Linger=no`; pakai cron (langkah 8) atau minta `loginctl enable-linger` |
 
 ---

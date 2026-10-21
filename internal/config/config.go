@@ -45,14 +45,15 @@ type CredentialsConfig struct {
 	File string `yaml:"file"`
 }
 
-// FoldersConfig berisi path folder kerja. Folder INCOMING, OUTCOMING, dan ERROR
-// WAJIB dibuat sebelum aplikasi dijalankan (lihat README).
+// FoldersConfig berisi path folder kerja. Folder INCOMING, OUTCOMING, ERROR,
+// dan INCOMING_SENT WAJIB dibuat sebelum aplikasi dijalankan (lihat README).
 type FoldersConfig struct {
-	Incoming  string `yaml:"incoming"`
-	Outcoming string `yaml:"outcoming"`
-	Error     string `yaml:"error"`
-	State     string `yaml:"state"`
-	Logs      string `yaml:"logs"`
+	Incoming     string `yaml:"incoming"`
+	Outcoming    string `yaml:"outcoming"`
+	Error        string `yaml:"error"`
+	IncomingSent string `yaml:"incoming_sent"`
+	State        string `yaml:"state"`
+	Logs         string `yaml:"logs"`
 }
 
 // WatcherConfig mengatur perilaku watcher upload & downloader.
@@ -78,8 +79,12 @@ type WatcherConfig struct {
 	// StabilityWindows adalah jumlah siklus "tidak berubah" untuk
 	// completion_method=stability sebelum folder dianggap selesai.
 	StabilityWindows int `yaml:"stability_windows"`
-	// OutputSuffix adalah akhiran nama file gabungan di OUTCOMING (mis. ".txt").
+	// OutputSuffix adalah akhiran nama file gabungan di OUTCOMING (mis. ".tafcm").
 	OutputSuffix string `yaml:"output_suffix"`
+	// RenameInputLower, bila true, mengupload file input dengan ekstensi .tafcm
+	// huruf kecil (mis. IN_20261020.txt -> IN_20261020.tafcm) tanpa mengubah
+	// isi file. Default true.
+	RenameInputLower bool `yaml:"rename_input_lower"`
 	// VerifyCounts membandingkan jumlah baris hasil gabungan dengan total_success
 	// dari overall-status (bila true). Default false (advisory).
 	VerifyCounts bool `yaml:"verify_counts"`
@@ -89,6 +94,9 @@ type WatcherConfig struct {
 type LoggingConfig struct {
 	Level string `yaml:"level"` // debug | info | warn | error
 	File  string `yaml:"file"`  // kosong = hanya ke stdout
+	// DailyRoll, bila true, menulis ke file harian <dir>/tafw-YYYYMMDD.log
+	// (mengabaikan suffix pada File; File dipakai sebagai prefix direktori+nama).
+	DailyRoll bool `yaml:"daily_roll"`
 }
 
 // Load membaca konfigurasi dari path (bila kosong pakai DefaultLocation),
@@ -128,8 +136,8 @@ func Default() *Config {
 		S3: S3Config{
 			Bucket:       "taf-batch",
 			Region:       "ap-southeast-3",
-			InputPrefix:  "sandbox/",
-			OutputPrefix: "sandbox/",
+			InputPrefix:  "SANDBOX/",
+			OutputPrefix: "SANDBOX/",
 			SSE:          "AES256",
 		},
 		Credentials: CredentialsConfig{
@@ -137,27 +145,30 @@ func Default() *Config {
 			File: "/etc/tafwatcher/credentials",
 		},
 		Folders: FoldersConfig{
-			Incoming:  "/opt/tafwatcher/INCOMING",
-			Outcoming: "/opt/tafwatcher/OUTCOMING",
-			Error:     "/opt/tafwatcher/ERROR",
-			State:     "/opt/tafwatcher/state",
-			Logs:      "/opt/tafwatcher/logs",
+			Incoming:     "/opt/tafwatcher/INCOMING",
+			Outcoming:    "/opt/tafwatcher/OUTCOMING",
+			Error:        "/opt/tafwatcher/ERROR",
+			IncomingSent: "/opt/tafwatcher/INCOMING_SENT",
+			State:        "/opt/tafwatcher/state",
+			Logs:         "/opt/tafwatcher/logs",
 		},
 		Watcher: WatcherConfig{
 			SettleSeconds:      10,
 			PollSeconds:        30,
 			CompletionMethod:   "status_json",
-			FilePatterns:       []string{"*.TAFCM"},
+			FilePatterns:       []string{"*.txt", "*.TAFCM"},
 			SuccessFolder:      "success=true",
 			FailedFolder:       "success=false",
 			OutputDirName:      "output",
 			OutputFolderPrefix: "TAFCM_",
 			StabilityWindows:   2,
-			OutputSuffix:       ".txt",
+			OutputSuffix:       ".tafcm",
+			RenameInputLower:   true,
 			VerifyCounts:       false,
 		},
 		Logging: LoggingConfig{
-			Level: "info",
+			Level:     "info",
+			DailyRoll: false,
 		},
 	}
 }
@@ -177,6 +188,7 @@ func applyEnv(c *Config) {
 	setStr(&c.Folders.Incoming, "TAFW_INCOMING")
 	setStr(&c.Folders.Outcoming, "TAFW_OUTCOMING")
 	setStr(&c.Folders.Error, "TAFW_ERROR")
+	setStr(&c.Folders.IncomingSent, "TAFW_INCOMING_SENT")
 	setStr(&c.Folders.State, "TAFW_STATE")
 	setStr(&c.Folders.Logs, "TAFW_LOGS")
 	setStr(&c.Watcher.CompletionMethod, "TAFW_COMPLETION_METHOD")
@@ -188,6 +200,8 @@ func applyEnv(c *Config) {
 	setInt(&c.Watcher.PollSeconds, "TAFW_POLL_SECONDS")
 	setInt(&c.Watcher.StabilityWindows, "TAFW_STABILITY_WINDOWS")
 	setBool(&c.Watcher.VerifyCounts, "TAFW_VERIFY_COUNTS")
+	setBool(&c.Watcher.RenameInputLower, "TAFW_RENAME_INPUT_LOWER")
+	setBool(&c.Logging.DailyRoll, "TAFW_LOG_DAILY_ROLL")
 }
 
 // normalize membersihkan input (trim spasi, samakan separator prefix).
@@ -213,13 +227,14 @@ func (c *Config) normalize() error {
 	c.Folders.Incoming = cleanPath(c.Folders.Incoming)
 	c.Folders.Outcoming = cleanPath(c.Folders.Outcoming)
 	c.Folders.Error = cleanPath(c.Folders.Error)
+	c.Folders.IncomingSent = cleanPath(c.Folders.IncomingSent)
 	c.Folders.State = cleanPath(c.Folders.State)
 	c.Folders.Logs = cleanPath(c.Folders.Logs)
 
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 
 	if len(c.Watcher.FilePatterns) == 0 {
-		c.Watcher.FilePatterns = []string{"*.TAFCM"}
+		c.Watcher.FilePatterns = []string{"*.txt", "*.TAFCM"}
 	}
 	return nil
 }
@@ -260,10 +275,11 @@ func (c *Config) Validate() error {
 	}
 
 	for name, p := range map[string]string{
-		"folders.incoming":  c.Folders.Incoming,
-		"folders.outcoming": c.Folders.Outcoming,
-		"folders.error":     c.Folders.Error,
-		"folders.state":     c.Folders.State,
+		"folders.incoming":      c.Folders.Incoming,
+		"folders.outcoming":     c.Folders.Outcoming,
+		"folders.error":         c.Folders.Error,
+		"folders.incoming_sent": c.Folders.IncomingSent,
+		"folders.state":         c.Folders.State,
 	} {
 		if p == "" {
 			errs = append(errs, name+" wajib diisi")

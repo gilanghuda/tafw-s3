@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // maxLogBytes adalah ambang rotasi sederhana: bila file log melebihi ukuran ini
@@ -19,6 +20,13 @@ const maxLogBytes = 50 * 1024 * 1024 // 50 MiB
 // New membuat logger berdasarkan level dan path file opsional.
 // Bila file kosong, log hanya ditulis ke stdout.
 func New(level, file string) (*slog.Logger, io.Closer, error) {
+	return NewWithRoll(level, file, false)
+}
+
+// NewWithRoll seperti New, namun bila dailyRoll true, log ditulis ke file
+// harian <dir>/tafw-YYYYMMDD.log; dalam mode ini File diperlakukan sebagai
+// direktori tujuan.
+func NewWithRoll(level, file string, dailyRoll bool) (*slog.Logger, io.Closer, error) {
 	lvl, err := parseLevel(level)
 	if err != nil {
 		return nil, nil, err
@@ -29,15 +37,28 @@ func New(level, file string) (*slog.Logger, io.Closer, error) {
 
 	var closer io.Closer
 	if file != "" {
-		if err := os.MkdirAll(filepath.Dir(file), 0o750); err != nil {
-			return nil, nil, fmt.Errorf("buat direktori log: %w", err)
+		if dailyRoll {
+			dir := file
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				return nil, nil, fmt.Errorf("buat direktori log: %w", err)
+			}
+			f, c, err := newDailyWriter(dir, time.Now())
+			if err != nil {
+				return nil, nil, err
+			}
+			writers = append(writers, f)
+			closer = c
+		} else {
+			if err := os.MkdirAll(filepath.Dir(file), 0o750); err != nil {
+				return nil, nil, fmt.Errorf("buat direktori log: %w", err)
+			}
+			f, err := openRotated(file)
+			if err != nil {
+				return nil, nil, err
+			}
+			writers = append(writers, f)
+			closer = f
 		}
-		f, err := openRotated(file)
-		if err != nil {
-			return nil, nil, err
-		}
-		writers = append(writers, f)
-		closer = f
 	}
 
 	out := io.MultiWriter(writers...)
@@ -51,6 +72,60 @@ func openRotated(path string) (*os.File, error) {
 		_ = os.Rename(path, path+".1")
 	}
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+}
+
+// dailyWriter menulis ke file log harian; saat tanggal berganti, file baru
+// dibuat dan file lama ditutup.
+type dailyWriter struct {
+	mu   sync.Mutex
+	dir  string
+	day  string
+	file *os.File
+}
+
+func newDailyWriter(dir string, t time.Time) (*dailyWriter, io.Closer, error) {
+	w := &dailyWriter{dir: dir}
+	if err := w.rotate(t); err != nil {
+		return nil, nil, err
+	}
+	return w, w, nil
+}
+
+func (w *dailyWriter) rotate(t time.Time) error {
+	day := t.Format("20060102")
+	if w.file != nil && day == w.day {
+		return nil
+	}
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
+	}
+	path := filepath.Join(w.dir, "tafw-"+day+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err != nil {
+		return fmt.Errorf("buka file log harian: %w", err)
+	}
+	w.file = f
+	w.day = day
+	return nil
+}
+
+func (w *dailyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.rotate(time.Now()); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
+
+func (w *dailyWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil {
+		return w.file.Close()
+	}
+	return nil
 }
 
 func parseLevel(level string) (slog.Level, error) {

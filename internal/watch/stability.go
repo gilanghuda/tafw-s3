@@ -88,3 +88,18 @@ func MatchAny(name string, patterns []string) bool {
 	}
 	return false
 }
+
+// ObjectName mengembalikan nama objek untuk sebuah file lokal. Bila lowerExt
+// true, ekstensi diganti menjadi ".tafcm" huruf kecil (mis. IN_20261020.txt ->
+// IN_20261020.tafcm) tanpa mengubah isi file. Bila false, nama file
+// dikembalikan apa adanya.
+func ObjectName(localName string, lowerExt bool) string {
+	if !lowerExt {
+		return localName
+	}
+	base := localName
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base + ".tafcm"
+}
